@@ -5,19 +5,37 @@ const path = require('path');
 const { execSync } = require('child_process');
 const deadletter = require('./deadletter');
 
-const HEARTBEAT_DIR  = path.join(os.homedir(), '.cache/todos-notion-sync');
-const HEARTBEAT_FILE = path.join(HEARTBEAT_DIR, 'heartbeat');
-const STALE_MS       = 30 * 60 * 1000; // 30 minutes
+const HEARTBEAT_DIR   = path.join(os.homedir(), '.cache/todos-notion-sync');
+const HEARTBEAT_FILE  = path.join(HEARTBEAT_DIR, 'heartbeat');
+const ALERT_SENT_FILE = path.join(HEARTBEAT_DIR, 'alert-sent');
+const STALE_MS        = 30 * 60 * 1000; // 30 minutes
 
-let alertSent = false; // avoid flooding; reset on recovery
+const RECOVERY_MIN_MS = 5 * 60 * 1000; // suppress recovery if stale lasted <5 min
 
 function touch() {
   fs.mkdirSync(HEARTBEAT_DIR, { recursive: true });
   fs.writeFileSync(HEARTBEAT_FILE, String(Date.now()), 'utf8');
-  if (alertSent) {
-    alertSent = false;
-    sendTelegram('✅ todos-notion-sync is healthy again (heartbeat recovered)').catch(() => {});
+  if (fs.existsSync(ALERT_SENT_FILE)) {
+    const alertSentAt = parseInt(fs.readFileSync(ALERT_SENT_FILE, 'utf8').trim(), 10);
+    fs.unlinkSync(ALERT_SENT_FILE);
+    const staleDurationMs = Date.now() - (isNaN(alertSentAt) ? 0 : alertSentAt);
+    if (staleDurationMs >= RECOVERY_MIN_MS) {
+      sendTelegram('✅ todos-notion-sync is healthy again (heartbeat recovered)').catch(() => {});
+    }
   }
+}
+
+// Returns true if any .md files (excluding kanban.md) were modified after the
+// last successful heartbeat — meaning real content is at risk of not being synced.
+function hasPendingChanges(lastHeartbeatMs) {
+  const { LOCAL_ROOT } = require('./config');
+  try {
+    return fs.readdirSync(LOCAL_ROOT).some(f => {
+      if (!f.endsWith('.md') || f === 'kanban.md') return false;
+      try { return fs.statSync(path.join(LOCAL_ROOT, f)).mtimeMs > lastHeartbeatMs; }
+      catch { return false; }
+    });
+  } catch { return false; }
 }
 
 function check(log) {
@@ -25,8 +43,13 @@ function check(log) {
   const last = parseInt(fs.readFileSync(HEARTBEAT_FILE, 'utf8').trim(), 10);
   if (isNaN(last)) return;
   const ageMs = Date.now() - last;
-  if (ageMs > STALE_MS && !alertSent) {
-    alertSent = true;
+  const alertAlreadySent = fs.existsSync(ALERT_SENT_FILE);
+
+  if (ageMs > STALE_MS && !alertAlreadySent) {
+    // Skip if there are no local files modified since the last sync — nothing is at risk.
+    if (!hasPendingChanges(last)) return;
+    fs.mkdirSync(HEARTBEAT_DIR, { recursive: true });
+    fs.writeFileSync(ALERT_SENT_FILE, String(Date.now()), 'utf8');
     const ageMin = Math.round(ageMs / 60000);
     const dead = deadletter.getFailedFiles(3);
     const deadInfo = dead.length > 0 ? `\n💀 ${dead.length} file(s) in dead-letter state: ${dead.map(f => f.file_path).join(', ')}` : '';
@@ -36,7 +59,7 @@ function check(log) {
   }
   // Also alert on dead-letter files even when heartbeat is healthy
   const dead = deadletter.getFailedFiles(3);
-  if (dead.length > 0 && !alertSent) {
+  if (dead.length > 0 && !alertAlreadySent) {
     const msg = `💀 todos-notion-sync: ${dead.length} file(s) stuck in dead-letter state (≥3 failed sync attempts):\n${dead.map(f => `• ${f.file_path}: ${f.last_error || 'unknown error'}`).join('\n')}`;
     if (log) log.warn('Dead-letter files detected', { count: dead.length, files: dead.map(f => f.file_path) });
     sendTelegram(msg).catch(() => {});

@@ -1,7 +1,7 @@
 {
-  "name": "todos-notion-sync",
+  "name": "notion-obsidian-sync",
   "version": "1.0.0",
-  "description": "Notion Todos database <-> local todos/ folder sync",
+  "description": "Two-way sync between a Notion database and local Markdown files, with an Obsidian kanban board",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
@@ -18,5 +18,8 @@
   },
   "devDependencies": {
     "jest": "^30.3.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
   }
 }

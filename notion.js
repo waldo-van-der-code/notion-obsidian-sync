@@ -105,9 +105,9 @@ async function queryInScopeItems() {
 // Query the 10 most recently edited Done items (sorted by last_edited_time)
 // Note: sorted by last_edited_time — no Completed at property in this DB.
 // Recently-edited Done items may float above more recently completed ones.
-async function queryDoneItems(limit = 10) {
+async function queryDoneItems() {
   const result = await request('POST', `/v1/databases/${DB_ID}/query`, {
-    page_size: limit,
+    page_size: 100,
     filter: { property: 'Status', status: { equals: 'Done' } },
     sorts: [{ timestamp: 'last_edited_time', direction: 'descending' }],
   });

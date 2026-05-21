@@ -2,7 +2,6 @@
 const fs      = require('fs');
 const path    = require('path');
 const chokidar = require('chokidar');
-const lockfile = require('proper-lockfile');
 
 const config   = require('./config');
 const log      = require('./log');
@@ -18,24 +17,47 @@ const deadletter = require('./deadletter');
 
 const DRY_RUN = process.argv.includes('--dry-run');
 
-// ── Lockfile helpers ──────────────────────────────────────────────────────────
-function isProcessAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+// ── Singleton guard — atomic PID file ────────────────────────────────────────
+const PID_FILE = '/tmp/todos-notion-sync.pid';
+
+function acquireSingletonLock() {
+  while (true) {
+    try {
+      const fd = fs.openSync(PID_FILE, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return; // lock acquired
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      // File exists — check if the holder is still alive
+      try {
+        const raw = fs.readFileSync(PID_FILE, 'utf8').trim();
+        const pid = parseInt(raw, 10);
+        if (!isNaN(pid) && pid !== process.pid) {
+          process.kill(pid, 0); // throws ESRCH if dead
+          process.stderr.write(`Another instance already running (PID ${pid}). Exiting.\n`);
+          process.exit(1);
+        }
+        // PID is our own or invalid — remove and retry
+        fs.unlinkSync(PID_FILE);
+      } catch (killErr) {
+        if (killErr.code === 'ESRCH') {
+          // Holder is dead — remove stale PID file and retry
+          try { fs.unlinkSync(PID_FILE); } catch {}
+        } else if (killErr.code === 'ENOENT') {
+          // File was removed between check and read — retry
+        } else {
+          throw killErr;
+        }
+      }
+    }
+  }
 }
 
-function clearStaleLock(lockBase) {
-  const lockDir = lockBase + '.lock';
+function releaseSingletonLock() {
   try {
-    // proper-lockfile uses a companion .lock directory containing a 'pid' file
-    const pidFile = require('path').join(lockDir, 'pid');
-    if (fs.existsSync(pidFile)) {
-      const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
-      if (!isNaN(pid) && isProcessAlive(pid)) return; // still running, don't clear
-    }
-    if (fs.existsSync(lockDir)) {
-      fs.rmSync(lockDir, { recursive: true, force: true });
-      process.stderr.write(`Cleared stale lockfile: ${lockDir}\n`);
-    }
+    const raw = fs.readFileSync(PID_FILE, 'utf8').trim();
+    if (parseInt(raw, 10) === process.pid) fs.unlinkSync(PID_FILE);
   } catch { /* best-effort */ }
 }
 
@@ -55,6 +77,8 @@ function debounce(key, fn, ms = 500) {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
+const POLL_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes — prevents pollInFlight from getting stuck on a hung API call
+
 let state;
 let lastDoneTitles = [];
 let isFirstPoll = true;
@@ -79,30 +103,15 @@ function existingPaths() {
 // ── Write a local file (with suppression) ─────────────────────────────────────
 function writeLocal(relPath, fields) {
   const abs = absPath(relPath);
-  // Preserve local notes if file already exists
-  let localNotes = '';
-  if (fs.existsSync(abs)) {
-    const parsed = parseFile(fs.readFileSync(abs, 'utf8'));
-    if (parsed) localNotes = parsed.localNotes || '';
-  }
   suppress(relPath);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
-  fs.writeFileSync(abs, renderFile({ ...fields, localNotes }), 'utf8');
+  fs.writeFileSync(abs, renderFile(fields), 'utf8');
 }
 
 // ── Archive a local file ──────────────────────────────────────────────────────
-function archiveLocal(relPath) {
-  const abs = absPath(relPath);
-  if (!fs.existsSync(abs)) return;
-  fs.mkdirSync(config.ARCHIVE_DIR, { recursive: true });
-  const dest = path.join(config.ARCHIVE_DIR, path.basename(relPath));
-  const final = fs.existsSync(dest)
-    ? dest.replace(/\.md$/, `-${Date.now()}.md`)
-    : dest;
-  suppress(relPath);
-  fs.renameSync(abs, final);
-  log.info('Archived local file', { relPath, dest: final });
-}
+// Files are no longer physically moved — they stay in todos/ for Obsidian access.
+// This function is a no-op kept for call-site compatibility.
+function archiveLocal(_relPath) { /* no-op — files stay in todos/ */ }
 
 // ── Create a new Notion page from a local file that has no notion_id ─────────
 async function createLocal(relPath) {
@@ -231,7 +240,14 @@ async function pullItem(notionId, fields, relPath) {
     return;
   }
   const body = await notion.fetchPageBody(notionId, config.LOCAL_ROOT);
-  writeLocal(relPath, { notion_id: notionId, ...fields, body });
+  // Preserve last_modified_at from the existing local file so a pull doesn't wipe it
+  const abs = absPath(relPath);
+  let existingLastModified = null;
+  if (fs.existsSync(abs)) {
+    const existingParsed = parseFile(fs.readFileSync(abs, 'utf8'));
+    existingLastModified = existingParsed?.last_modified_at || null;
+  }
+  writeLocal(relPath, { notion_id: notionId, ...fields, body, last_modified_at: existingLastModified });
   stateLib.setEntry(state, notionId, {
     path:               relPath,
     title:              fields.title,
@@ -285,7 +301,7 @@ async function pushLocal(relPath) {
     || JSON.stringify(corrected.categories) !== JSON.stringify(parsed.categories);
   if (needsCorrection) {
     log.info('Push: correcting case variants in frontmatter', { relPath, corrected });
-    const rewritten = renderFile({ ...parsed, ...corrected });
+    const rewritten = renderFile({ ...parsed, ...corrected }); // last_modified_at preserved via spread
     suppress(relPath);
     fs.writeFileSync(abs, rewritten, 'utf8');
     Object.assign(parsed, corrected);
@@ -324,12 +340,20 @@ async function pushLocal(relPath) {
     const newRemoteLastEdited = updatedPage?.last_edited_time
       || await notion.fetchLastEditedTime(notionId);
 
-    // Clear any visible sync-error comment now that push succeeded
+    // Stamp last_modified_at from the file's mtime (before we rewrite it below).
+    // This records when the user last edited the file, not when the daemon synced it.
+    const lastModifiedAt = new Date(fs.statSync(abs).mtimeMs).toISOString();
+
+    // Rewrite file to stamp last_modified_at and clear any sync-error comment
     const currentContent = fs.readFileSync(abs, 'utf8');
-    const cleared = clearSyncError(currentContent);
-    if (cleared !== currentContent) {
+    const currentParsed  = parseFile(currentContent);
+    const withTimestamp  = currentParsed
+      ? renderFile({ ...currentParsed, last_modified_at: lastModifiedAt })
+      : clearSyncError(currentContent);
+    const finalContent   = currentParsed ? clearSyncError(withTimestamp) : withTimestamp;
+    if (finalContent !== currentContent) {
       suppress(relPath);
-      fs.writeFileSync(abs, cleared, 'utf8');
+      fs.writeFileSync(abs, finalContent, 'utf8');
     }
 
     deadletter.recordSuccess(relPath);
@@ -346,6 +370,10 @@ async function pushLocal(relPath) {
       last_error:         null,
     });
     stateLib.saveState(state);
+    // Rebuild kanban so the next poll's syncKanbanToNotion doesn't see a stale
+    // column position and push the old status back to Notion.
+    suppress('__kanban__');
+    rebuildKanban(state, lastDoneTitles);
     log.info('→ push', { relPath, notionId, title: parsed.title });
   } catch (err) {
     log.error('Push failed', { relPath, notionId, err: err.message });
@@ -412,6 +440,9 @@ async function syncKanbanToNotion(skipIds = new Set()) {
       const entry = stateLib.getEntryById(state, notionId);
       if (!entry || entry.sync_status === 'archived') continue;
       if (entry.status === currentStatus) continue;
+      // Skip items pulled this cycle — the kanban hasn't been rebuilt yet so the
+      // stale column position would overwrite the status we just pulled from Notion.
+      if (skipIds.has(notionId)) continue;
       changes.push({ notionId, filename, newStatus: currentStatus, entry });
       continue;
     }
@@ -529,13 +560,10 @@ async function syncKanbanToNotion(skipIds = new Set()) {
     }
     try {
       await notion.updatePageFields(notionId, { status: 'Done', outcome: 'Dropped' });
-      archiveLocal(relPath);
       stateLib.setEntry(state, notionId, {
         status:      'Done',
         outcome:     'Dropped',
         sync_status: 'archived',
-        path:        null,
-        archived_path: relPath,
       });
       stateLib.saveState(state);
       log.info('kanban → dropped', { relPath, notionId, title: entry.title });
@@ -555,7 +583,12 @@ async function syncKanbanToNotion(skipIds = new Set()) {
 async function poll() {
   pollInFlight = true;
   try {
-    return await _poll();
+    await Promise.race([
+      _poll(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Poll timed out after ${POLL_TIMEOUT_MS / 1000}s`)), POLL_TIMEOUT_MS)
+      ),
+    ]);
   } finally {
     pollInFlight = false;
   }
@@ -573,13 +606,26 @@ async function _poll() {
   }
 
   try {
-    const donePages = await notion.queryDoneItems(10);
+    const donePages = await notion.queryDoneItems();
+
+    // Build notion_id → filename lookup by scanning todos/ for files with matching notion_id
+    const localIdMap = new Map();
+    try {
+      for (const f of fs.readdirSync(config.LOCAL_ROOT)) {
+        if (!f.endsWith('.md')) continue;
+        const stem = path.basename(f, '.md');
+        const raw = fs.readFileSync(path.join(config.LOCAL_ROOT, f), 'utf8');
+        const parsed = parseFile(raw);
+        if (parsed?.notion_id) localIdMap.set(parsed.notion_id, stem);
+      }
+    } catch { /* LOCAL_ROOT may not exist yet */ }
+
     lastDoneTitles = donePages.map(p => {
       const fields = notion.extractFields(p);
-      // Look up archived_path from state so kanban can render a wikilink
       const entry = stateLib.getEntryById(state, p.id);
-      const archivedPath = entry?.archived_path || entry?.path;
-      const filename = archivedPath ? path.basename(archivedPath, '.md') : null;
+      const filename = (entry?.path ? path.basename(entry.path, '.md') : null)
+        ?? localIdMap.get(p.id)
+        ?? null;
       return { title: fields.title, filename };
     });
   } catch (err) {
@@ -592,10 +638,9 @@ async function _poll() {
   for (const [id, entry] of Object.entries(state.pages_by_id)) {
     if (entry.sync_status === 'archived') continue;
     if (!remoteIds.has(id)) {
-      log.info('Item left scope, archiving', { notionId: id, path: entry.path });
-      if (DRY_RUN) { console.log(`[DRY-RUN] archive ${entry.path}`); continue; }
-      if (entry.path) archiveLocal(entry.path);
-      stateLib.setEntry(state, id, { sync_status: 'archived', path: null, archived_path: entry.path });
+      log.info('Item left scope, marking archived', { notionId: id, path: entry.path });
+      if (DRY_RUN) { console.log(`[DRY-RUN] mark archived ${entry.path}`); continue; }
+      stateLib.setEntry(state, id, { sync_status: 'archived' }); // file stays in todos/
       stateLib.saveState(state);
     }
   }
@@ -654,6 +699,9 @@ async function _poll() {
       const relPath = entry.path || toFilename(notionId, fields.title, existingPaths());
       if (DRY_RUN) { console.log(`[DRY-RUN] update ${relPath} "${fields.title}"`); continue; }
       await pullItem(notionId, fields, relPath);
+      // Mark as newly pulled so syncKanbanToNotion doesn't re-push the stale kanban
+      // status back to Notion before the kanban file has been rebuilt.
+      newlyPulledIds.add(notionId);
     }
   }
 
@@ -695,24 +743,10 @@ async function main() {
   fs.mkdirSync(config.ARCHIVE_DIR, { recursive: true });
 
   if (!DRY_RUN) {
-    const lockBase = config.LOCK_PATH;
-    // Clear stale lock from a previous crashed process before attempting to acquire
-    clearStaleLock(lockBase);
-    if (!fs.existsSync(lockBase)) fs.writeFileSync(lockBase, '');
-    try {
-      lockfile.lockSync(lockBase);
-    } catch {
-      process.stderr.write('Another instance is already running. Exiting.\n');
-      process.exit(1);
-    }
-
-    // Release lock cleanly on shutdown so the next start isn't blocked
-    function releaseLock() {
-      try { lockfile.unlockSync(lockBase); } catch { /* best-effort */ }
-      process.exit(0);
-    }
-    process.on('SIGTERM', releaseLock);
-    process.on('SIGINT',  releaseLock);
+    acquireSingletonLock();
+    function shutdown() { releaseSingletonLock(); process.exit(0); }
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT',  shutdown);
   }
 
   try {

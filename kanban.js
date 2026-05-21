@@ -38,14 +38,15 @@ function rebuildKanban(state, doneTitles = []) {
 
   const toCards     = entries => entries.map(e => `- [ ] ${e.link}`).join('\n') || '';
   const toDoneCards = items => items.map(item => {
-    const card = item.filename ? `[[${WIKILINK_PREFIX}/${item.filename}|${item.title}]]` : item.title;
-    return `- [ ] ${card}`;
+    // Use filename-only wikilinks so Obsidian resolves them vault-wide regardless of subfolder
+    const card = item.filename ? `[[${item.filename}|${item.title}]]` : item.title;
+    return `- [x] ${card}`;
   }).join('\n') || '';
 
   const sections = [
     `## ${BACKLOG_COLUMN_LABEL}\n\n${toCards(backlogEntries)}`,
     `## 🔄 In Progress\n\n${toCards(inProgress)}`,
-    `## ✅ Done (last 10)\n\n${toDoneCards(doneTitles)}`,
+    `## ✅ Done\n\n${toDoneCards(doneTitles)}`,
   ];
 
   const content = [

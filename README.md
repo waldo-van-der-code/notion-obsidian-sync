@@ -55,7 +55,7 @@ The daemon validates the schema on startup and exits with a clear error if `Stat
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/waldov86/notion-obsidian-sync.git
+git clone https://github.com/waldo-van-der-code/notion-obsidian-sync.git
 cd notion-obsidian-sync
 npm install
 ```

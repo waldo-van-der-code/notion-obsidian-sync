@@ -3,6 +3,7 @@ const { markdownToBlocks } = require('@tryfabric/martian');
 const {
   VALID_STATUSES, VALID_HORIZONS, VALID_OUTCOMES, VALID_CATEGORIES,
   STATUS_ALIASES, HORIZON_ALIASES, OUTCOME_ALIASES, CATEGORY_ALIASES,
+  HAS_HORIZON, HAS_OUTCOME, HAS_CATEGORY,
 } = require('./config');
 const log = require('./log');
 
@@ -58,11 +59,11 @@ function parseFile(content) {
     ? afterFm.slice(markerIdx + (afterFm.indexOf(LOCAL_MARKER) >= 0 ? LOCAL_MARKER.length : oldMarker.length)).trim()
     : '';
 
-  // Extract H1 title — first line of synced part
+  // Extract H1 title
   const h1Match = syncPart.match(/^#\s+(.+)$/m);
   const title = h1Match ? h1Match[1].trim() : '';
 
-  // Body = synced part minus the H1 line (m flag so ^ matches after \n)
+  // Body = everything after the H1 line
   const body = syncPart.replace(/^#\s+.+\n?/m, '').trim();
 
   const categories = fm.category
@@ -70,21 +71,26 @@ function parseFile(content) {
     : [];
 
   return {
-    notion_id:  fm.notion_id || null,
+    notion_id:         fm.notion_id || null,
     title,
-    status:     fm.status   || '',
-    horizon:    fm.horizon  || '',
-    outcome:    fm.outcome  || '',
+    status:            fm.status   || '',
+    horizon:           fm.horizon  || '',
+    outcome:           fm.outcome  || '',
     categories,
     body,
     localNotes,
+    last_modified_at:  fm.last_modified_at || null,
   };
 }
 
 // Validate parsed fields against allowed enums.
 // Returns { errors: string[], corrected: object } where corrected has case-normalised values.
 // Unknown values that differ only in case are silently corrected; genuinely unknown values error.
-function validateFields({ status, horizon, outcome = '', categories = [] }) {
+// Pass { validCategories, categoryAliases } as second arg to override config (useful in tests).
+function validateFields({ status, horizon, outcome = '', categories = [] }, {
+  validCategories = VALID_CATEGORIES,
+  categoryAliases = CATEGORY_ALIASES,
+} = {}) {
   const errors = [];
 
   const correctedStatus = STATUS_ALIASES.get(status.toLowerCase()) ?? status;
@@ -103,9 +109,10 @@ function validateFields({ status, horizon, outcome = '', categories = [] }) {
   }
 
   const correctedCategories = categories.map(cat => {
-    const canonical = CATEGORY_ALIASES.get(cat.toLowerCase()) ?? cat;
-    if (!VALID_CATEGORIES.has(canonical)) {
-      errors.push(`Invalid category "${cat}" — allowed: ${[...VALID_CATEGORIES].join(', ')}`);
+    const canonical = categoryAliases.get(cat.toLowerCase()) ?? cat;
+    // If validCategories is empty (no config), treat all values as valid
+    if (validCategories.size > 0 && !validCategories.has(canonical)) {
+      errors.push(`Invalid category "${cat}" — allowed: ${[...validCategories].join(', ')}`);
     }
     return canonical;
   });
@@ -132,26 +139,33 @@ function bodyToBlocks(body) {
   }
 }
 
-// Render a local .md file from a Notion item
-function renderFile({ notion_id, title, status, horizon, outcome = '', categories = [], body = '', localNotes = '' }) {
+// Render a local .md file from a Notion item.
+// last_modified_at: if provided, written to frontmatter so Obsidian can display it.
+//   The daemon never sets this field — it is set only by pushLocal (from fs.stat mtime)
+//   so it always reflects when the user last edited the file.
+function renderFile({ notion_id, title, status, horizon, outcome = '', categories = [], body = '', localNotes = '', last_modified_at = null }) {
   const bodySection = body ? `\n\n${body}` : '';
-  const notes = localNotes
-    ? `\n\n${LOCAL_MARKER}\n${localNotes}`
-    : `\n\n${LOCAL_MARKER}`;
-  return [
-    '---',
+  const fm = [
     `notion_id: ${notion_id}`,
     `status: ${status}`,
-    `horizon: ${horizon || ''}`,
-    `outcome: ${outcome || ''}`,
-    `category: ${categories.join(', ')}`,
+    ...(HAS_HORIZON  ? [`horizon: ${horizon || ''}`]            : []),
+    ...(HAS_OUTCOME  ? [`outcome: ${outcome || ''}`]            : []),
+    ...(HAS_CATEGORY ? [`category: ${categories.join(', ')}`]   : []),
     `last_synced_at: ${new Date().toISOString()}`,
+    ...(last_modified_at ? [`last_modified_at: ${last_modified_at}`] : []),
+  ];
+  const localSection = localNotes
+    ? `\n${LOCAL_MARKER}\n${localNotes}\n`
+    : '';
+  return [
+    '---',
+    ...fm,
     '---',
     '',
     `# ${title}`,
     bodySection,
-    notes,
     '',
+    localSection,
   ].join('\n');
 }
 
