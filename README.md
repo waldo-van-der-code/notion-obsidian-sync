@@ -9,13 +9,13 @@ Built for people who want Notion as a task cockpit (mobile, sharing, rich views)
 ## What it does
 
 ```
-Notion database  ←→  ~/notes/todos/*.md  →  kanban.md (Obsidian board)
+Notion database  ←→  ~/notes/todos/*.md  ←→  kanban.md (Obsidian board)
 ```
 
 - **Pull**: new/changed Notion pages appear as `.md` files with YAML frontmatter
 - **Push**: edits to `.md` files (title, status, body) sync back to Notion within 500 ms
 - **Create**: drop a new `.md` file in the folder → a Notion page is created automatically
-- **Kanban board**: `kanban.md` is rebuilt after every sync — `[[wikilink]]` cards grouped by Status, sortable by Horizon
+- **Kanban board (bidirectional)**: `kanban.md` is rebuilt after every sync; dragging a card to a different column in Obsidian is detected within ~1 s and the status is pushed to Notion immediately — no waiting for the next poll
 - **Instant Notion→Local**: HTTP trigger endpoint + Cloudflare Tunnel lets webhook integrations (n8n, Zapier) force an immediate poll on Notion changes
 - **Dead-letter journal**: failed syncs are tracked in a local SQLite database; `node deadletter.js --status` shows stuck files
 - **Heartbeat alerts**: if the daemon goes silent for 30+ minutes, a Telegram message is sent (credentials via macOS Keychain or env vars)
@@ -215,7 +215,7 @@ Custom field enums (via `config.json` only):
 ## Known edge cases
 
 - **Obsidian kanban plugin race**: if the plugin rewrites `kanban.md` while the daemon is mid-poll, the empty-kanban guard will block any drops. The next poll (or a manual `POST /trigger-poll`) resolves it cleanly.
-- **`kanban.md` is output-only**: never edit it directly. The daemon overwrites it on every poll. Edit status by changing the `status:` field in the individual `.md` file, or drag the card in Obsidian — both paths sync to Notion.
+- **`kanban.md` is the kanban input and output**: the daemon overwrites it on every poll, but it also watches it for changes. Dragging a card to a new column in the Obsidian kanban plugin triggers an immediate sync to Notion (via a dedicated file watcher, not the poll timer). You can also edit status by changing the `status:` field in the individual `.md` file — both paths sync to Notion.
 - **Body sync is best-effort**: complex Notion blocks (databases, synced blocks, embeds) are flattened to markdown. The body round-trips cleanly for text, headings, bullets, and code blocks.
 - **Rename detection**: if you rename a file in Obsidian (which creates a new file), the daemon detects the `notion_id` match and updates state + pushes the new title to Notion.
 

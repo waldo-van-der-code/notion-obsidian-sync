@@ -83,6 +83,7 @@ let state;
 let lastDoneTitles = [];
 let isFirstPoll = true;
 let pollInFlight = false;
+let lastKanbanMtime = 0; // used to skip syncKanbanToNotion when file hasn't changed
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function absPath(relPath) { return path.join(config.LOCAL_ROOT, relPath); }
@@ -388,6 +389,9 @@ async function pushLocal(relPath) {
 // from drop detection since the kanban hasn't been rebuilt to include them yet.
 async function syncKanbanToNotion(skipIds = new Set()) {
   if (!fs.existsSync(config.KANBAN_PATH)) return;
+  const currentMtime = fs.statSync(config.KANBAN_PATH).mtimeMs;
+  if (currentMtime <= lastKanbanMtime && skipIds.size === 0) return;
+  lastKanbanMtime = currentMtime;
   const raw = fs.readFileSync(config.KANBAN_PATH, 'utf8');
 
   // Safety: count active items in state before parsing the kanban
@@ -858,6 +862,22 @@ async function main() {
       }
       createLocal(rel).catch(err => log.error('watcher add error', { rel, err: err.message }));
     }, 1000);
+  });
+
+  // Dedicated watcher on kanban.md — fires syncKanbanToNotion immediately when the
+  // user drags a card in Obsidian, without waiting for the next scheduled poll.
+  chokidar.watch(config.KANBAN_PATH, {
+    persistent: true,
+    ignoreInitial: true,
+    awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 },
+  }).on('change', () => {
+    if (isSuppressed('__kanban__')) return;
+    debounce('kanban-change', async () => {
+      if (pollInFlight) { log.info('Kanban watcher: poll in flight, skipping'); return; }
+      log.info('Kanban watcher: change detected, syncing to Notion');
+      try { await syncKanbanToNotion(); }
+      catch (err) { log.error('Kanban watcher sync error', { err: err.message }); }
+    }, 800);
   });
 
   setInterval(async () => {
