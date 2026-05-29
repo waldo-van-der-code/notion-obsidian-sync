@@ -12,23 +12,34 @@ Built for people who want Notion as a task cockpit (mobile, sharing, rich views)
 Notion database  ←→  ~/notes/todos/*.md  ←→  kanban.md (Obsidian board)
 ```
 
-- **Pull**: new/changed Notion pages appear as `.md` files with YAML frontmatter
-- **Push**: edits to `.md` files (title, status, body) sync back to Notion within 500 ms
-- **Create**: drop a new `.md` file in the folder → a Notion page is created automatically
-- **Kanban board (bidirectional)**: `kanban.md` is rebuilt after every sync; dragging a card to a different column in Obsidian is detected within ~1 s and the status is pushed to Notion immediately — no waiting for the next poll
-- **Instant Notion→Local**: HTTP trigger endpoint + Cloudflare Tunnel lets webhook integrations (n8n, Zapier) force an immediate poll on Notion changes
+All three directions are live:
+
+- **Notion → Local**: new or changed Notion pages pull to `.md` files with YAML frontmatter within one poll interval (default 5 min, or immediately via HTTP trigger)
+- **Local → Notion**: edits to `.md` files (title, status, horizon, outcome, category, body) push to Notion within ~500 ms via a file watcher — no poll needed
+- **Kanban → Notion**: dragging a card to a different column in the Obsidian kanban plugin updates the Notion status within ~1 s, via a dedicated `kanban.md` watcher
+- **Local create**: drop a new `.md` file in the folder → a Notion page is created automatically
+- **Instant Notion→Local**: HTTP trigger endpoint + Cloudflare Tunnel lets webhook integrations (n8n, Zapier) force an immediate poll on any Notion change
 - **Dead-letter journal**: failed syncs are tracked in a local SQLite database; `node deadletter.js --status` shows stuck files
 - **Heartbeat alerts**: if the daemon goes silent for 30+ minutes, a Telegram message is sent (credentials via macOS Keychain or env vars)
 
+### Conflict resolution
+
+When both sides change between polls, the daemon compares timestamps:
+
+- **Local file mtime > Notion `last_edited_time`** → local wins, push to Notion
+- **Notion is newer** → remote wins, pull overwrites local
+
+Both cases are logged at `warn` level so you can audit them.
+
 ### Safety guards (learned from a 28-task wipeout)
 
-Two hard limits protect against bulk data loss:
+1. **Empty-kanban guard** — if `kanban.md` is parsed with zero active items but internal state has active items, the sync aborts. Fires when Obsidian writes a blank file or races with the daemon.
 
-1. **Empty-kanban guard** — if `kanban.md` is parsed and found to contain zero active items, but the internal state has active items, the sync aborts. This fires when Obsidian writes a blank file or the kanban plugin races with the daemon.
+2. **Catastrophic-drop guard** — if removing items from the kanban would affect more than 5 items *and* more than 50% of the active board in one pass, the drop is aborted. Status changes and new cards still go through.
 
-2. **Catastrophic-drop guard** — if removing items from the kanban would affect more than 5 items *and* more than 50% of the active board in a single pass, the drop is aborted. Status changes and new cards still go through; only the mass-drop is blocked.
+3. **Concurrency guard** — a `pollInFlight` flag prevents the scheduled poll and the HTTP trigger from running simultaneously. The second caller skips and logs.
 
-3. **Concurrency guard** — a `pollInFlight` flag prevents the scheduled poll and the HTTP trigger from running simultaneously. Whichever call arrives second skips and logs a line.
+4. **Mtime skip** — `syncKanbanToNotion` checks `kanban.md` mtime before parsing. If the file hasn't changed since the last run, the parse is skipped — so the every-5-min poll has no extra cost for the kanban path.
 
 All guards log a `SAFETY:` warn entry so you know what happened.
 
@@ -131,6 +142,7 @@ horizon: Now
 outcome:
 category: work, project-x
 last_synced_at: 2026-04-30T12:00:00.000Z
+last_modified_at: 2026-04-30T11:58:00.000Z
 ---
 
 # My task title
@@ -141,20 +153,44 @@ Optional body content that syncs to the Notion page body.
 Private notes here — only visible locally.
 ```
 
-Fields owned by **Notion** (source of truth): `notion_id`, `last_synced_at`  
-Fields owned by **local** (push wins on conflict): `status`, `horizon`, `outcome`, `category`, title, body  
-Fields never synced: anything below the `<!-- local: -->` marker
+| Field | Owner | Notes |
+|---|---|---|
+| `notion_id` | Notion | Set on first pull or push; never edit manually |
+| `last_synced_at` | daemon | Updated on every pull; read-only |
+| `last_modified_at` | daemon | Set from file mtime when a push succeeds; reflects when you last edited the file |
+| `status` | local | Push wins on conflict |
+| `horizon` | local | Push wins on conflict |
+| `outcome` | local | Push wins on conflict |
+| `category` | local | Comma-separated; must match `validCategories` if that list is non-empty |
+| title (H1) | local | Push wins on conflict |
+| body | local | Everything below the H1, above the `<!-- local: -->` marker |
+| local notes | never synced | Everything below the `<!-- local: -->` marker |
 
 ---
 
-## Conflict resolution
+## How each sync path works
 
-When both sides change between polls, the daemon compares timestamps:
+### Local `.md` → Notion (file watcher, ~500 ms)
 
-- **Local file mtime > Notion last_edited_time** → local wins, push to Notion
-- **Notion newer** → remote wins, pull overwrites local
+chokidar watches `LOCAL_ROOT`. On any `.md` change, the daemon debounces 500 ms, parses the file, hashes the fields, and pushes only if the hash changed. A `last_modified_at` timestamp (from `fs.stat` mtime) is written back to the frontmatter on success so you can see when you last edited it.
 
-Both cases are logged at `warn` level.
+Validation runs before every push. If a field value isn't in the allowed enum (e.g. an unknown `category`), the push is rejected and a `<!-- sync-error: -->` comment is injected at the bottom of the file. Fix the frontmatter and save to retry — the daemon will pick it up immediately.
+
+### kanban.md → Notion (kanban watcher, ~1 s)
+
+A second chokidar watcher monitors `KANBAN_PATH` specifically. When Obsidian rewrites the file after a card drag, the watcher debounces 800 ms (after chokidar's own 500 ms write-finish stabilization) and calls `syncKanbanToNotion`. That function:
+
+1. Checks `mtime` — skips entirely if the file hasn't changed since last run
+2. Parses the column headings and card wikilinks
+3. Pushes any status changes to Notion (e.g. `Backlog → In progress`)
+4. Creates local files + Notion pages for new cards added directly in the kanban UI
+5. Marks items removed from active columns as `Done/Dropped` (with catastrophic-drop guard)
+
+The watcher is suppressed while the daemon is writing `kanban.md` itself (using a `__kanban__` suppress token), so self-writes don't loop back.
+
+### Notion → Local (poll, every 5 min or triggered)
+
+The daemon queries the Notion DB for all in-scope items (default: `Backlog` + `In progress`). For each item whose `last_edited_time` changed since the last sync, it fetches the page body and writes the local `.md` file. On conflict (both sides changed), the newer timestamp wins.
 
 ---
 
@@ -173,8 +209,6 @@ Use this to make Notion→Local sync effectively instant. The pattern that works
 3. Have the automation POST to your tunnel URL on every Notion change
 
 The daemon uses `127.0.0.1` (not `localhost`) — make sure your curl command and automation use the right host.
-
-A concurrency guard ensures that if a triggered poll arrives while the scheduled poll is already running, it skips rather than stacking. So rapid-fire Notion events are safe.
 
 ### Useful alias
 
@@ -203,21 +237,24 @@ alias sync-now='curl -s -X POST http://127.0.0.1:9876/trigger-poll && echo "sync
 
 Custom field enums (via `config.json` only):
 
-| Key | Default |
-|---|---|
-| `validStatuses` | `["Backlog", "In progress", "Done"]` |
-| `validHorizons` | `["Now", "Later", ""]` |
-| `validOutcomes` | `["Completed", "Dropped", ""]` |
-| `validCategories` | `[]` (any value accepted) |
+| Key | Default | Notes |
+|---|---|---|
+| `validStatuses` | `["Backlog", "In progress", "Done"]` | Must match your Notion Status options |
+| `validHorizons` | `["Now", "Later", ""]` | Must match your Horizon select options |
+| `validOutcomes` | `["Completed", "Dropped", ""]` | Must match your Outcome select options |
+| `validCategories` | `[]` (any value accepted) | If non-empty, pushes with unlisted categories are rejected |
+
+> **Tip:** If a push is rejected with `Invalid category "X"`, add `"X"` to `validCategories` in `config.json` and restart the daemon. The rejected file will be automatically retried on startup.
 
 ---
 
 ## Known edge cases
 
 - **Obsidian kanban plugin race**: if the plugin rewrites `kanban.md` while the daemon is mid-poll, the empty-kanban guard will block any drops. The next poll (or a manual `POST /trigger-poll`) resolves it cleanly.
-- **`kanban.md` is the kanban input and output**: the daemon overwrites it on every poll, but it also watches it for changes. Dragging a card to a new column in the Obsidian kanban plugin triggers an immediate sync to Notion (via a dedicated file watcher, not the poll timer). You can also edit status by changing the `status:` field in the individual `.md` file — both paths sync to Notion.
-- **Body sync is best-effort**: complex Notion blocks (databases, synced blocks, embeds) are flattened to markdown. The body round-trips cleanly for text, headings, bullets, and code blocks.
+- **kanban.md is both input and output**: the daemon rebuilds it on every poll, but also watches it for changes. The `__kanban__` suppress token prevents the daemon's own writes from triggering a sync loop.
+- **Body sync is best-effort**: complex Notion blocks (databases, synced blocks, embeds) are flattened to markdown. Text, headings, bullets, and code blocks round-trip cleanly.
 - **Rename detection**: if you rename a file in Obsidian (which creates a new file), the daemon detects the `notion_id` match and updates state + pushes the new title to Notion.
+- **`last_synced_at` vs `last_modified_at`**: `last_synced_at` is updated on every pull (daemon-owned). `last_modified_at` is set only when a push succeeds and reflects your last edit (from `fs.stat` mtime). Use `last_modified_at` to see when you last touched the file.
 
 ---
 
@@ -293,6 +330,7 @@ This reduces Notion API calls significantly:
 |---|---|
 | Edit Notion, wait for pull (every 5 min) | 1 poll + 1 page fetch per change |
 | Edit local `.md`, push triggers immediately | 1 write per change, no polling needed |
+| Drag card in Obsidian kanban | 1 status update, triggered within ~1 s |
 
 For teams using Notion as a read/view layer (dashboards, mobile access, sharing) while doing all editing locally, the daemon can run with `POLL_INTERVAL_MS=3600000` (hourly) — pulling Notion changes rarely — and rely on the file watcher for near-instant pushes.
 
