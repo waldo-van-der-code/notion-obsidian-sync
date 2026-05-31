@@ -54,7 +54,7 @@ function rebuildKanban(state, doneTitles = []) {
     'kanban-plugin: board',
     '---',
     '',
-    '<!-- AUTO-GENERATED — do not edit. To change a task status, edit its status: field in todos/<filename>.md -->',
+    '<!-- AUTO-GENERATED — drag cards in Obsidian to change status, or edit status: in the task .md file directly -->',
     '',
     sections.join('\n\n\n'),
     '',

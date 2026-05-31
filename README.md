@@ -39,7 +39,9 @@ Both cases are logged at `warn` level so you can audit them.
 
 3. **Concurrency guard** — a `pollInFlight` flag prevents the scheduled poll and the HTTP trigger from running simultaneously. The second caller skips and logs.
 
-4. **Mtime skip** — `syncKanbanToNotion` checks `kanban.md` mtime before parsing. If the file hasn't changed since the last run, the parse is skipped — so the every-5-min poll has no extra cost for the kanban path.
+4. **Poll timeout** — if a poll hangs (e.g. on a stalled Notion API call), `pollInFlight` is forcibly reset after 2 minutes so the daemon doesn't get permanently stuck.
+
+5. **Mtime skip** — `syncKanbanToNotion` checks `kanban.md` mtime before parsing. If the file hasn't changed since the last run, the parse is skipped — so the every-5-min poll has no extra cost for the kanban path.
 
 All guards log a `SAFETY:` warn entry so you know what happened.
 
@@ -190,7 +192,11 @@ The watcher is suppressed while the daemon is writing `kanban.md` itself (using 
 
 ### Notion → Local (poll, every 5 min or triggered)
 
-The daemon queries the Notion DB for all in-scope items (default: `Backlog` + `In progress`). For each item whose `last_edited_time` changed since the last sync, it fetches the page body and writes the local `.md` file. On conflict (both sides changed), the newer timestamp wins.
+The daemon queries the Notion DB for all in-scope items (default: `Backlog` + `In progress`; configurable via `inScopeStatuses`). For each item whose `last_edited_time` changed since the last sync, it fetches the page body and writes the local `.md` file. On conflict (both sides changed), the newer timestamp wins.
+
+### Startup error retry
+
+On startup, any file with `sync_status: error` in the state (e.g. a failed push from a previous run) is automatically retried before the first poll. This means transient errors (rate limits, network blips) self-heal on restart without manual intervention.
 
 ---
 
@@ -226,14 +232,29 @@ alias sync-now='curl -s -X POST http://127.0.0.1:9876/trigger-poll && echo "sync
 | `NOTION_DB_ID` | `dbId` | — | Notion database ID (required) |
 | `NOTION_TOKEN_PATH` | `tokenPath` | `~/.config/notion/token` | Path to token file |
 | `LOCAL_ROOT` | `localRoot` | `~/notion-todos` | Folder for local `.md` files |
-| `ARCHIVE_DIR` | `archiveDir` | `<localRoot>/.archive` | Where completed files are archived |
-| `KANBAN_PATH` | `kanbanPath` | `<localRoot>/../kanban.md` | Output path for the kanban board |
+| `ARCHIVE_DIR` | `archiveDir` | `<localRoot>/.archive` | Directory created on startup but not actively used — files stay in `LOCAL_ROOT` (see note below) |
+| `KANBAN_PATH` | `kanbanPath` | `<localRoot>/../kanban.md` | Path for the generated kanban board |
 | `STATE_PATH` | `statePath` | `~/.config/notion-obsidian-sync/state.json` | Sync state file |
 | `LOG_PATH` | `logPath` | `~/.config/notion-obsidian-sync/sync.log` | Log file (JSON lines, 5 MB rotation) |
-| `LOCK_PATH` | `lockPath` | `/tmp/notion-obsidian-sync.lock` | Lockfile (prevents duplicate instances) |
 | `POLL_INTERVAL_MS` | `pollIntervalMs` | `300000` (5 min) | How often to poll Notion |
 | `TRIGGER_PORT` | `triggerPort` | `9876` | Port for the HTTP trigger endpoint |
 | `CONFIG_PATH` | — | `./config.json` | Path to config file |
+| `TITLE_PROPERTY` | `titleProperty` | `Name` | Name of the title property in your Notion DB |
+| `WIKILINK_PREFIX` | `wikilinkPrefix` | `notion-todos` | Vault-relative path prefix for wikilinks in `kanban.md` (e.g. `notes/todos`) |
+| `BACKLOG_COLUMN_LABEL` | `backlogColumnLabel` | `📥 Backlog` | First column heading in the generated kanban board |
+| — | `kanbanSettings` | *(see config.example.json)* | Raw Obsidian kanban plugin settings JSON injected at the bottom of `kanban.md` |
+
+> **`ARCHIVE_DIR` note:** completed files are **not** moved to `.archive`. They stay in `LOCAL_ROOT` so Obsidian can still resolve their wikilinks. The directory is created on startup for forward compatibility.
+
+> **Singleton guard:** the daemon uses a PID file (not a lockfile) to prevent duplicate instances. If the process holding the PID is dead, the stale file is cleaned up automatically on the next start.
+
+Optional property flags (via `config.json` only — set `false` if your Notion DB omits that field):
+
+| Key | Default | Notes |
+|---|---|---|
+| `hasHorizon` | `true` | Set `false` if your DB has no Horizon property |
+| `hasOutcome` | `true` | Set `false` if your DB has no Outcome property |
+| `hasCategory` | `true` | Set `false` if your DB has no Category property |
 
 Custom field enums (via `config.json` only):
 
@@ -243,6 +264,7 @@ Custom field enums (via `config.json` only):
 | `validHorizons` | `["Now", "Later", ""]` | Must match your Horizon select options |
 | `validOutcomes` | `["Completed", "Dropped", ""]` | Must match your Outcome select options |
 | `validCategories` | `[]` (any value accepted) | If non-empty, pushes with unlisted categories are rejected |
+| `inScopeStatuses` | all statuses except `Done` | Which Notion statuses to include in the poll query |
 
 > **Tip:** If a push is rejected with `Invalid category "X"`, add `"X"` to `validCategories` in `config.json` and restart the daemon. The rejected file will be automatically retried on startup.
 
@@ -251,7 +273,7 @@ Custom field enums (via `config.json` only):
 ## Known edge cases
 
 - **Obsidian kanban plugin race**: if the plugin rewrites `kanban.md` while the daemon is mid-poll, the empty-kanban guard will block any drops. The next poll (or a manual `POST /trigger-poll`) resolves it cleanly.
-- **kanban.md is both input and output**: the daemon rebuilds it on every poll, but also watches it for changes. The `__kanban__` suppress token prevents the daemon's own writes from triggering a sync loop.
+- **kanban.md is both input and output**: the daemon rebuilds it on every poll, but also watches it for changes. You can drag cards between columns using the Obsidian kanban plugin — that is a supported workflow. The `__kanban__` suppress token prevents the daemon's own writes from triggering a sync loop. Do not hand-edit the raw Markdown in `kanban.md`; always use the Obsidian UI or edit the task `.md` file directly.
 - **Body sync is best-effort**: complex Notion blocks (databases, synced blocks, embeds) are flattened to markdown. Text, headings, bullets, and code blocks round-trip cleanly.
 - **Rename detection**: if you rename a file in Obsidian (which creates a new file), the daemon detects the `notion_id` match and updates state + pushes the new title to Notion.
 - **`last_synced_at` vs `last_modified_at`**: `last_synced_at` is updated on every pull (daemon-owned). `last_modified_at` is set only when a push succeeds and reflects your last edit (from `fs.stat` mtime). Use `last_modified_at` to see when you last touched the file.
