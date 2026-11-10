@@ -2,6 +2,8 @@
 
 A battle-tested daemon that keeps a Notion database in two-way sync with a folder of local Markdown files, and auto-generates an Obsidian kanban board from the live state.
 
+**The story behind it:** https://waldo.vanderlore.de/blog/notion-obsidian-sync-war-story/
+
 Built for people who want Notion as a task cockpit (mobile, sharing, rich views) while keeping a local Markdown view that plays nicely with editors like Obsidian, VS Code, or just `grep`.
 
 ---
